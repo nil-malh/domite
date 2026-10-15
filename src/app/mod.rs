@@ -1608,7 +1608,7 @@ impl App {
         }
 
         if !q.is_empty() {
-            all.sort_by(|a, b| b.2.cmp(&a.2));
+            all.sort_by_key(|a| std::cmp::Reverse(a.2));
         }
         all.into_iter().map(|(l, d, _)| (l, d)).collect()
     }

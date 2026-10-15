@@ -61,7 +61,7 @@ jobs:
             use_cross: true
             archive: tar.gz
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             use_cross: false
             archive: tar.gz
           - target: aarch64-apple-darwin
@@ -110,7 +110,7 @@ jobs:
           mkdir -p "dist/${PKG}/completions"
           cp "target/${{ matrix.target }}/release/domite" "dist/${PKG}/"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/${PKG}/"
-          if [ "${{ matrix.use_cross }}" = "false" ]; then
+          if "dist/${PKG}/domite" --version >/dev/null 2>&1; then
             "dist/${PKG}/domite" --completions bash > "dist/${PKG}/completions/domite.bash"
             "dist/${PKG}/domite" --completions zsh > "dist/${PKG}/completions/_domite"
             "dist/${PKG}/domite" --completions fish > "dist/${PKG}/completions/domite.fish"
