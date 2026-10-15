@@ -1,4 +1,4 @@
-# 🌋 domite
+# 🌋 Domite
 
 *A fast, keyboard-driven terminal UI for [michelin/ns4kafka](https://github.com/michelin/ns4kafka), built in Rust the [sofka](https://github.com/nklmilojevic/sofka) way.*
 
