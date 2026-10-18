@@ -305,6 +305,8 @@ fn eval_cmp(cmp: &Cmp, headers: &[String], cells: &[String], age_secs: Option<i6
             || h_lower.replace('-', "_") == cmp.key.replace('-', "_")
             || (cmp.key == "ns" && h_lower == "namespace")
             || (cmp.key == "rf" && h_lower == "replication-factor")
+            || (cmp.key == "topic" && h_lower == "topics")
+            || (cmp.key == "lag" && h_lower == "total-lag")
     });
     let Some(idx) = col_idx else {
         return false;
@@ -329,7 +331,16 @@ fn eval_cmp(cmp: &Cmp, headers: &[String], cells: &[String], age_secs: Option<i6
             };
             cmp.op.eval(actual.cmp(want))
         }
-        CmpValue::Str(want) => cmp.op.eval(cmp_folded_lower(cell.trim(), want)),
+        CmpValue::Str(want) => {
+            let cell_trimmed = cell.trim();
+            if cmp.op == Op::Eq && cell_trimmed.contains(',') {
+                cell_trimmed
+                    .split(',')
+                    .any(|part| cmp_folded_lower(part.trim(), want) == std::cmp::Ordering::Equal)
+            } else {
+                cmp.op.eval(cmp_folded_lower(cell_trimmed, want))
+            }
+        }
     }
 }
 
@@ -818,5 +829,93 @@ mod tests {
             Some(3600),
             &f
         ));
+    }
+
+    #[test]
+    fn evaluates_regex_alternatives_labels_boolean_groups_and_errors() {
+        let f = Fuzzy::new();
+        let headers = vec![
+            "NAME".to_string(),
+            "PARTITIONS".to_string(),
+            "RF".to_string(),
+            "STATUS".to_string(),
+        ];
+        let cells = vec![
+            "orders.dlq.v1".to_string(),
+            "3".to_string(),
+            "5".to_string(),
+            "Fail".to_string(),
+        ];
+        let mut labels = HashMap::new();
+        labels.insert("tier".to_string(), "critical".to_string());
+        labels.insert("tag".to_string(), "DLQ".to_string());
+
+        // Alternatives `a|b`
+        assert!(parse("payments|dlq").matches_row(
+            Some("team-orders"),
+            "orders.dlq.v1",
+            &headers,
+            &cells,
+            &labels,
+            Some(7200),
+            &f
+        ));
+
+        // Regex `/^orders\..*\.v1$/`
+        assert!(parse(r"/^orders\..*\.v1$/").matches_row(
+            Some("team-orders"),
+            "orders.dlq.v1",
+            &headers,
+            &cells,
+            &labels,
+            Some(7200),
+            &f
+        ));
+
+        // Negated regex `!/settled/`
+        assert!(parse("!/settled/").matches_row(
+            Some("team-orders"),
+            "orders.dlq.v1",
+            &headers,
+            &cells,
+            &labels,
+            Some(7200),
+            &f
+        ));
+
+        // Label matching `label:critical` and `label:tag=DLQ` and `!label:prod`
+        assert!(
+            parse("label:critical label:tag=DLQ !label:prod").matches_row(
+                Some("team-orders"),
+                "orders.dlq.v1",
+                &headers,
+                &cells,
+                &labels,
+                Some(7200),
+                &f
+            )
+        );
+
+        // Nested boolean groups with `&&`, `||`, and `!(...)`
+        let complex = parse("(status=Pending || status=Fail) && !(partitions>10 || rf<3)");
+        assert!(complex.error().is_none());
+        assert!(complex.matches_row(
+            Some("team-orders"),
+            "orders.dlq.v1",
+            &headers,
+            &cells,
+            &labels,
+            Some(7200),
+            &f
+        ));
+
+        // Malformed filters report user-friendly errors without panicking
+        assert!(parse("(unclosed group").error().is_some());
+        assert!(parse("status=").error().is_some());
+        assert!(parse("age<badunit").error().is_some());
+        assert!(parse("label:~fuzzyNotAllowed").error().is_some());
+        assert!(parse("/[unclosed/").error().is_some());
+        assert!(parse("a &&").error().is_some());
+        assert!(parse("|| b").error().is_some());
     }
 }

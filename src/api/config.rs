@@ -83,6 +83,9 @@ pub struct DomiteConfig {
     /// Poll interval in seconds for the active resource view (default: 5).
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+    /// TTL in hours for cached Schema Registry subject details before background revalidation (default: 24).
+    #[serde(default = "default_schema_cache_ttl_hours")]
+    pub schema_cache_ttl_hours: u64,
     /// Global read-only mode.
     #[serde(default)]
     pub readonly: Option<bool>,
@@ -99,6 +102,10 @@ pub struct DomiteConfig {
 
 fn default_poll_interval() -> u64 {
     5
+}
+
+fn default_schema_cache_ttl_hours() -> u64 {
+    24
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -156,6 +163,7 @@ impl Default for LoadedConfig {
         Self {
             domite: DomiteConfig {
                 poll_interval_secs: 5,
+                schema_cache_ttl_hours: 24,
                 ..DomiteConfig::default()
             },
             contexts: Vec::new(),
@@ -180,12 +188,16 @@ impl LoadedConfig {
                         if cfg.poll_interval_secs == 0 {
                             cfg.poll_interval_secs = 5;
                         }
+                        if cfg.schema_cache_ttl_hours == 0 {
+                            cfg.schema_cache_ttl_hours = 24;
+                        }
                         cfg
                     }
                     Err(e) => {
                         warnings.push(format!("{}: {e}", path.display()));
                         DomiteConfig {
                             poll_interval_secs: 5,
+                            schema_cache_ttl_hours: 24,
                             ..DomiteConfig::default()
                         }
                     }
@@ -194,12 +206,14 @@ impl LoadedConfig {
                     warnings.push(format!("{}: {e}", path.display()));
                     DomiteConfig {
                         poll_interval_secs: 5,
+                        schema_cache_ttl_hours: 24,
                         ..DomiteConfig::default()
                     }
                 }
             },
             _ => DomiteConfig {
                 poll_interval_secs: 5,
+                schema_cache_ttl_hours: 24,
                 ..DomiteConfig::default()
             },
         };
@@ -427,5 +441,139 @@ kafkactl:
         assert!(!contexts[0].readonly);
         assert_eq!(contexts[1].name, "prod-eu");
         assert!(contexts[1].readonly);
+    }
+
+    #[test]
+    fn resolves_active_context_from_top_level_kafkactl_api_and_namespace() {
+        // Mirrors how `kafkactl use-context` writes top-level `api` and `current-namespace`
+        let yaml = r#"
+kafkactl:
+  api: https://ns4kafka-indus-api.domain.com
+  current-namespace: ioomgbl0
+  user-token: topLevelToken
+  contexts:
+    - name: oom-cqt
+      context:
+        api: https://ns4kafka-dev-api.domain.com
+        namespace: coomgbl0
+        userToken: cqtToken
+    - name: oom-indus
+      context:
+        api: https://ns4kafka-indus-api.domain.com
+        namespace: ioomgbl0
+        userToken: indusToken
+    - name: oom-cat
+      context:
+        api: https://ns4kafka-indus-api.domain.com
+        namespace: aoomgbl1
+        userToken: catToken
+"#;
+        let domite = DomiteConfig::default();
+        let (contexts, current) = parse_kafkactl_yaml(yaml, &domite).unwrap();
+        assert_eq!(current.as_deref(), Some("oom-indus"));
+        assert_eq!(contexts.len(), 3);
+    }
+
+    #[test]
+    fn synthesizes_default_context_when_top_level_api_has_no_matching_entry() {
+        let yaml = r#"
+kafkactl:
+  api: https://standalone.ns4kafka.local
+  current-namespace: my-ns
+  user-token: secretTok
+"#;
+        let domite = DomiteConfig::default();
+        let (contexts, current) = parse_kafkactl_yaml(yaml, &domite).unwrap();
+        assert_eq!(current.as_deref(), Some("default"));
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].api, "https://standalone.ns4kafka.local");
+        assert_eq!(contexts[0].namespace, "my-ns");
+    }
+
+    #[test]
+    fn loads_and_merges_domite_toml_and_kafkactl_yaml_from_disk() {
+        let dir = std::env::temp_dir().join(format!("domite-cfg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let kc_path = dir.join("config.yml");
+        let domite_path = dir.join("config.toml");
+
+        std::fs::write(
+            &kc_path,
+            r#"
+kafkactl:
+  current-context: prod-cluster
+  contexts:
+    - name: prod-cluster
+      context:
+        api: https://prod.ns4kafka.local
+        user-token: tok1
+        namespace: ns-prod
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            &domite_path,
+            r#"
+poll_interval_secs = 10
+schema_cache_ttl_hours = 48
+min_server_version = "1.22.0"
+
+[skin]
+name = "nord"
+background = true
+
+[contexts.prod-cluster]
+readonly = false
+namespace = "ns-overridden"
+
+[contexts.extra-toml-ctx]
+api = "https://extra.ns4kafka.local"
+namespace = "ns-extra"
+readonly = true
+
+[views.topics]
+replace = false
+sort = "PARTITIONS"
+sort_desc = true
+columns = [
+  { name = "MIN-ISR", path = "/spec/configs/min.insync.replicas", kind = "number", wide = false }
+]
+"#,
+        )
+        .unwrap();
+
+        let loaded = LoadedConfig::load(Some(&kc_path), Some(&domite_path));
+        assert!(
+            loaded.warnings.is_empty(),
+            "warnings: {:?}",
+            loaded.warnings
+        );
+        assert_eq!(loaded.domite.poll_interval_secs, 10);
+        assert_eq!(loaded.domite.schema_cache_ttl_hours, 48);
+        assert_eq!(loaded.domite.skin.name.as_deref(), Some("nord"));
+        assert!(loaded.domite.skin.background);
+        assert_eq!(loaded.contexts.len(), 2);
+
+        let prod = loaded.find_context("prod-cluster").unwrap();
+        assert!(
+            !prod.readonly,
+            "TOML override should allow disabling prod readonly"
+        );
+        assert_eq!(prod.namespace, "ns-overridden");
+
+        let extra = loaded.find_context("extra-toml-ctx").unwrap();
+        assert!(extra.readonly);
+        assert_eq!(extra.api, "https://extra.ns4kafka.local");
+
+        // Invalid TOML syntax should record a warning and fall back to defaults without panicking
+        std::fs::write(&domite_path, "not valid toml = = =").unwrap();
+        let bad_loaded = LoadedConfig::load(Some(&kc_path), Some(&domite_path));
+        assert!(!bad_loaded.warnings.is_empty());
+        assert_eq!(bad_loaded.domite.poll_interval_secs, 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

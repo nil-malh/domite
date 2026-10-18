@@ -541,7 +541,28 @@ mod tests {
     fn all_builtin_skins_resolve() {
         for name in BUILTIN_NAMES {
             assert!(builtin(name).is_some(), "missing skin {name}");
+            assert_eq!(canonical_skin_name(name), *name);
         }
+    }
+
+    #[test]
+    fn validates_and_applies_custom_swatch_overrides() {
+        let mut colors = HashMap::new();
+        colors.insert("red".into(), "#ff0000".into());
+        colors.insert("lavender".into(), "00ff00".into());
+        let warnings = validate_skin(Some("nord"), &colors);
+        assert!(warnings.is_empty());
+
+        let resolved = resolve_skin(Some("nord"), &colors);
+        assert_eq!(resolved.red, Color::Rgb(255, 0, 0));
+        assert_eq!(resolved.lavender, Color::Rgb(0, 255, 0));
+
+        // Unknown skin name, unknown swatch key, and malformed hex produce warnings
+        let mut bad_colors = HashMap::new();
+        bad_colors.insert("not_a_swatch".into(), "#112233".into());
+        bad_colors.insert("blue".into(), "#xyz".into());
+        let bad_warnings = validate_skin(Some("unknown-skin"), &bad_colors);
+        assert_eq!(bad_warnings.len(), 3);
     }
 
     #[test]

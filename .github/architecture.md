@@ -20,6 +20,7 @@ src/
 ├── applog.rs        Non-blocking logfmt background logger (DOMITE_LOG=1) with automatic redaction
 ├── api/
 │   ├── mod.rs
+│   ├── cache.rs     Long-lived disk & memory cache (~/.cache/domite/) with stale-while-revalidate TTL
 │   ├── config.rs    Loads ~/.kafkactl/config.yml contexts & ~/.config/domite/config.toml UI/view overrides
 │   ├── discovery.rs GET /api-resources registry + ConsumerGroup + alias resolution (to, co, cg, sc, ac, st, cc, qu, rb, ns)
 │   ├── client.rs    Ns4KafkaClient trait, HttpClient (reqwest + rustls-tls-native-roots + JWT cache), FakeClient
@@ -84,10 +85,12 @@ Every `PollTarget` and background task carries `app.generation: u64`. Whenever t
   5. As each subject resolves, it writes to `SchemaCache`, removes itself from `SchemaInFlight`, and emits `Msg::Applied { generation, key, obj }`.
   6. If the user presses `Enter` (pretty-printed schema view) or `y` (raw YAML view) on a row that is still hydrating, `App::fetch_schema_and_open` immediately fetches that subject on demand.
 
-### 3.2 Consumer Groups (`ConsumerGroup`)
-- Exposed at `/api/namespaces/{ns}/consumer-groups` (not listed by `/api-resources`, so `DiscoveryRegistry` injects it automatically with aliases `consumer-groups`, `cg`, `groups`, `group`).
-- Each item in the response represents a single `(group, topic, partition)` lag entry, so `store::row_key` builds a composite key `{namespace}/{group}/{topic}/{partition}`.
-- Non-declarative (`is_declarative() == false`): cannot be edited with `e`, but supports offset reset (`POST .../consumer-groups/{group}/reset?dryrun=true|false` with `TO_EARLIEST`, `TO_LATEST`, `TO_DATETIME`, `TO_OFFSET`, `SHIFT_BY`) and deletion (`DELETE .../consumer-groups/{group}?dryrun=true|false`) via the `t` action menu.
+### 3.2 Consumer Groups (`ConsumerGroup`, `ExternalConsumerGroup`, `ConsumerGroupMember`)
+- Exposed at `/api/namespaces/{ns}/consumer-groups` and `/api/namespaces/{ns}/consumer-groups/_/external` (injected into `DiscoveryRegistry` with aliases `cg`, `consumer-groups`, `groups` and `cg-ext`, `ext-cg`, `external-groups`).
+- Because `ns4kafka`'s `ConsumerGroupService.findByWildcardName` only includes partition offsets when `consumerGroupIds.size() == 1`, `domite` uses a two-level pipeline:
+  1. **Group Summary Table (`ConsumerGroup` / `ExternalConsumerGroup`)**: `client::aggregate_consumer_groups` produces one row per group (`NAME | OWNERSHIP | STATE | TOPICS | PARTITIONS | TOTAL-LAG | MAX-LAG`), merging owned and external groups. Unhydrated owned groups (`_hydrating: true`, showing `…`) are hydrated in the background by `poller::spawn_cg_hydrator` via `GET /api/namespaces/{ns}/consumer-groups?name={group}`.
+  2. **Partition Lag Drill-Down (`ConsumerGroupMember`)**: Pressing `Enter` on a group drills down into its per-partition lag rows (`GROUP | STATE | TOPIC | PARTITION | CURRENT-OFFSET | END-OFFSET | LAG`, keyed as `{ns}/{group}/{topic}/{partition}`).
+- Supports all 6 `ns4kafka` offset reset methods (`TO_EARLIEST`, `TO_LATEST`, `TO_DATETIME`, `BY_DURATION`, `TO_OFFSET`, `SHIFT_BY`) scoped to all topics (`*`), a single topic, or a specific `topic:partition` (when triggered from `ConsumerGroupMember`), plus group deletion and topic jump.
 
 ### 3.3 Resource Quotas (`ResourceQuota`)
 - `GET /api/namespaces/{ns}/resource-quotas` returns `ResourceQuotaResponse` objects where `spec` contains summary strings like `"countTopic": "3/20"`, `"diskTopic": "4.5GiB/50.0GiB"`.

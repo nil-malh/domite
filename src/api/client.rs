@@ -197,6 +197,7 @@ pub trait Ns4KafkaClient: Send + Sync {
         compatibility: Option<&str>,
     ) -> Result<Value, ApiError>;
     async fn get_schema(&self, namespace: &str, subject: &str) -> Result<Value, ApiError>;
+    async fn get_consumer_group(&self, namespace: &str, group: &str) -> Result<Value, ApiError>;
     async fn reset_user_password(&self, namespace: &str, user: &str) -> Result<Value, ApiError>;
     async fn vault_passwords(
         &self,
@@ -510,6 +511,52 @@ impl Ns4KafkaClient for HttpClient {
         namespace: Option<&str>,
         def: &ResourceDefinition,
     ) -> Result<Vec<Value>, ApiError> {
+        if def.kind == "ConsumerGroup" {
+            let ns = namespace
+                .filter(|n| !n.is_empty() && *n != "*")
+                .unwrap_or(&self.ctx.namespace);
+            let owned_path = format!(
+                "/api/namespaces/{}/consumer-groups",
+                urlencoding::encode(ns)
+            );
+            let (_, _, owned_text) = self
+                .send_authed(reqwest::Method::GET, &owned_path, None)
+                .await?;
+            let owned_raw: Vec<Value> = serde_json::from_str(&owned_text)
+                .map_err(|e| ApiError::parse_err(format!("invalid consumer-groups JSON: {e}")))?;
+            let mut groups = aggregate_consumer_groups(owned_raw, "Owned");
+
+            let ext_path = format!(
+                "/api/namespaces/{}/consumer-groups/_/external",
+                urlencoding::encode(ns)
+            );
+            if let Ok((_, _, ext_text)) = self
+                .send_authed(reqwest::Method::GET, &ext_path, None)
+                .await
+                && let Ok(ext_raw) = serde_json::from_str::<Vec<Value>>(&ext_text)
+            {
+                groups.extend(aggregate_consumer_groups(ext_raw, "External"));
+            }
+            return Ok(groups);
+        }
+
+        if def.kind == "ExternalConsumerGroup" {
+            let ns = namespace
+                .filter(|n| !n.is_empty() && *n != "*")
+                .unwrap_or(&self.ctx.namespace);
+            let ext_path = format!(
+                "/api/namespaces/{}/consumer-groups/_/external",
+                urlencoding::encode(ns)
+            );
+            let (_, _, ext_text) = self
+                .send_authed(reqwest::Method::GET, &ext_path, None)
+                .await?;
+            let ext_raw: Vec<Value> = serde_json::from_str(&ext_text).map_err(|e| {
+                ApiError::parse_err(format!("invalid external consumer-groups JSON: {e}"))
+            })?;
+            return Ok(aggregate_consumer_groups(ext_raw, "External"));
+        }
+
         let path = if !def.namespaced || def.path == "namespaces" {
             "/api/namespaces".to_string()
         } else {
@@ -790,6 +837,36 @@ impl Ns4KafkaClient for HttpClient {
         }
     }
 
+    async fn get_consumer_group(&self, namespace: &str, group: &str) -> Result<Value, ApiError> {
+        let url = format!(
+            "/api/namespaces/{}/consumer-groups?name={}",
+            urlencoding::encode(namespace),
+            urlencoding::encode(group)
+        );
+        let (_, _, text) = self.send_authed(reqwest::Method::GET, &url, None).await?;
+        let raw_items: Vec<Value> = serde_json::from_str(&text)
+            .map_err(|e| ApiError::parse_err(format!("invalid consumer-group detail JSON: {e}")))?;
+        let mut aggregated = aggregate_consumer_groups(raw_items, "Owned");
+        if let Some(mut first) = aggregated.drain(..).next() {
+            // Mark as hydrated even if the group has 0 committed offsets (e.g. brand-new EMPTY group)
+            if first.get("_cgTopics").is_none()
+                && let Some(obj) = first.as_object_mut()
+            {
+                obj.insert("_cgTopics".into(), Value::String("-".into()));
+                obj.insert("_cgPartitions".into(), Value::Number(0.into()));
+                obj.insert("_cgTotalLag".into(), Value::Number(0.into()));
+                obj.insert("_cgMaxLag".into(), Value::Number(0.into()));
+            }
+            Ok(first)
+        } else {
+            Err(ApiError {
+                message: format!("ConsumerGroup '{group}' not found in '{namespace}'"),
+                failure: PollFailure::Server,
+                status: Some(404),
+            })
+        }
+    }
+
     async fn reset_user_password(&self, namespace: &str, user: &str) -> Result<Value, ApiError> {
         let url = format!(
             "/api/namespaces/{}/users/{}/reset-password",
@@ -859,6 +936,97 @@ pub fn expand_quota_rows(kind: &str, list: Vec<Value>) -> Vec<Value> {
         }
     }
     expanded
+}
+
+/// Aggregate raw ns4kafka `ConsumerGroup` partition items into one summary object per group.
+///
+/// When `ns4kafka` returns stub items (`status.topic == null` because >1 owned group matched
+/// `name=*`), `_cgTopics` is omitted so the poller knows to hydrate that group in the background
+/// via `GET /api/namespaces/{ns}/consumer-groups?name={groupId}`.
+/// When partition offsets are present (single-group query or `/consumer-groups/_/external`),
+/// computes `_cgTopics`, `_cgPartitions`, `_cgTotalLag`, `_cgMaxLag`, and `_cgItems`.
+pub fn aggregate_consumer_groups(raw_items: Vec<Value>, ownership: &str) -> Vec<Value> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_name: HashMap<String, Vec<Value>> = HashMap::new();
+    for item in raw_items {
+        let name = item
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>")
+            .to_string();
+        if !by_name.contains_key(&name) {
+            order.push(name.clone());
+        }
+        by_name.entry(name).or_default().push(item);
+    }
+
+    let mut out = Vec::with_capacity(order.len());
+    for name in order {
+        let Some(items) = by_name.remove(&name) else {
+            continue;
+        };
+        let first = items[0].clone();
+        let metadata = first.get("metadata").cloned().unwrap_or_else(|| json!({}));
+        let state = first
+            .pointer("/status/state")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_string();
+
+        let mut topics: Vec<String> = Vec::new();
+        let mut partition_items: Vec<Value> = Vec::new();
+        let mut total_lag = 0i64;
+        let mut max_lag = 0i64;
+
+        for mut item in items {
+            if let Some(topic) = item
+                .pointer("/status/topic")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                if !topics.contains(&topic) {
+                    topics.push(topic);
+                }
+                let lag = item
+                    .pointer("/status/lag")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                total_lag += lag;
+                if lag > max_lag {
+                    max_lag = lag;
+                }
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("kind".into(), Value::String("ConsumerGroupMember".into()));
+                }
+                partition_items.push(item);
+            }
+        }
+
+        let mut group_obj = json!({
+            "apiVersion": "v1",
+            "kind": "ConsumerGroup",
+            "metadata": metadata,
+            "status": {
+                "state": state,
+            },
+            "_cgOwnership": ownership,
+        });
+
+        if !partition_items.is_empty()
+            && let Some(map) = group_obj.as_object_mut()
+        {
+            map.insert("_cgTopics".into(), Value::String(topics.join(",")));
+            map.insert(
+                "_cgPartitions".into(),
+                Value::Number((partition_items.len() as i64).into()),
+            );
+            map.insert("_cgTotalLag".into(), Value::Number(total_lag.into()));
+            map.insert("_cgMaxLag".into(), Value::Number(max_lag.into()));
+            map.insert("_cgItems".into(), Value::Array(partition_items));
+        }
+        out.push(group_obj);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,6 +1337,27 @@ impl FakeClient {
         );
 
         by_path.insert(
+            "consumer-groups/_/external".into(),
+            vec![json!({
+                "apiVersion": "v1",
+                "kind": "ConsumerGroup",
+                "metadata": {
+                    "name": "payments.order-reader",
+                    "namespace": "team-orders",
+                    "cluster": "puy-de-dome"
+                },
+                "status": {
+                    "state": "STABLE",
+                    "topic": "orders.created.v1",
+                    "partition": 0,
+                    "currentOffset": 14800,
+                    "logEndOffset": 14820,
+                    "lag": 20
+                }
+            })],
+        );
+
+        by_path.insert(
             "schemas".into(),
             vec![
                 json!({
@@ -1432,6 +1621,115 @@ impl Ns4KafkaClient for FakeClient {
                 status: Some(403),
             });
         }
+
+        // Handle ConsumerGroupMember drill-down (`consumer-groups?name=<group>` or `consumer-groups/_/external?name=<group>`)
+        if def.kind == "ConsumerGroupMember" {
+            let (base_path, name_filter) = def
+                .path
+                .split_once("?name=")
+                .map(|(p, n)| {
+                    (
+                        p,
+                        Some(
+                            urlencoding::decode(n)
+                                .map(|c| c.into_owned())
+                                .unwrap_or_else(|_| n.to_string()),
+                        ),
+                    )
+                })
+                .unwrap_or((&def.path, None));
+            let items = state.by_path.get(base_path).cloned().unwrap_or_default();
+            let filtered: Vec<Value> = items
+                .into_iter()
+                .filter(|v| {
+                    let ns_ok = match namespace {
+                        Some(ns) if !ns.is_empty() && ns != "*" => {
+                            v.pointer("/metadata/namespace").and_then(Value::as_str) == Some(ns)
+                        }
+                        _ => true,
+                    };
+                    let name_ok = match &name_filter {
+                        Some(want) => {
+                            v.pointer("/metadata/name").and_then(Value::as_str)
+                                == Some(want.as_str())
+                        }
+                        None => true,
+                    };
+                    ns_ok && name_ok
+                })
+                .map(|mut v| {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("kind".into(), Value::String("ConsumerGroupMember".into()));
+                    }
+                    v
+                })
+                .collect();
+            return Ok(filtered);
+        }
+
+        if def.kind == "ConsumerGroup" {
+            let owned_items: Vec<Value> = state
+                .by_path
+                .get("consumer-groups")
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| match namespace {
+                    Some(ns) if !ns.is_empty() && ns != "*" => {
+                        v.pointer("/metadata/namespace").and_then(Value::as_str) == Some(ns)
+                    }
+                    _ => true,
+                })
+                .collect();
+            let mut groups = aggregate_consumer_groups(owned_items, "Owned");
+            // Mirror ns4kafka ConsumerGroupService.findByWildcardName: when >1 owned group matches `name=*`,
+            // the list response returns only `(name, state)` without partition offsets (hydrated in background).
+            if groups.len() > 1 {
+                for g in &mut groups {
+                    if let Some(obj) = g.as_object_mut() {
+                        obj.remove("_cgTopics");
+                        obj.remove("_cgPartitions");
+                        obj.remove("_cgTotalLag");
+                        obj.remove("_cgMaxLag");
+                        obj.remove("_cgItems");
+                    }
+                }
+            }
+
+            let ext_items: Vec<Value> = state
+                .by_path
+                .get("consumer-groups/_/external")
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| match namespace {
+                    Some(ns) if !ns.is_empty() && ns != "*" => {
+                        v.pointer("/metadata/namespace").and_then(Value::as_str) == Some(ns)
+                    }
+                    _ => true,
+                })
+                .collect();
+            groups.extend(aggregate_consumer_groups(ext_items, "External"));
+            return Ok(groups);
+        }
+
+        if def.kind == "ExternalConsumerGroup" {
+            let ext_items: Vec<Value> = state
+                .by_path
+                .get("consumer-groups/_/external")
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| match namespace {
+                    Some(ns) if !ns.is_empty() && ns != "*" => {
+                        v.pointer("/metadata/namespace").and_then(Value::as_str) == Some(ns)
+                    }
+                    _ => true,
+                })
+                .collect();
+            return Ok(aggregate_consumer_groups(ext_items, "External"));
+        }
+
         let items = state.by_path.get(&def.path).cloned().unwrap_or_default();
         let mut filtered: Vec<Value> = if !def.namespaced || def.path == "namespaces" {
             items
@@ -1778,6 +2076,39 @@ impl Ns4KafkaClient for FakeClient {
         })
     }
 
+    async fn get_consumer_group(&self, namespace: &str, group: &str) -> Result<Value, ApiError> {
+        let state = self.state.read().unwrap();
+        let matching: Vec<Value> = state
+            .by_path
+            .get("consumer-groups")
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|v| {
+                v.pointer("/metadata/name").and_then(Value::as_str) == Some(group)
+                    && v.pointer("/metadata/namespace").and_then(Value::as_str) == Some(namespace)
+            })
+            .collect();
+        let mut agg = aggregate_consumer_groups(matching, "Owned");
+        if let Some(mut first) = agg.drain(..).next() {
+            if first.get("_cgTopics").is_none()
+                && let Some(obj) = first.as_object_mut()
+            {
+                obj.insert("_cgTopics".into(), Value::String("-".into()));
+                obj.insert("_cgPartitions".into(), Value::Number(0.into()));
+                obj.insert("_cgTotalLag".into(), Value::Number(0.into()));
+                obj.insert("_cgMaxLag".into(), Value::Number(0.into()));
+            }
+            Ok(first)
+        } else {
+            Err(ApiError {
+                message: format!("ConsumerGroup '{group}' not found in '{namespace}'"),
+                failure: PollFailure::Server,
+                status: Some(404),
+            })
+        }
+    }
+
     async fn reset_user_password(&self, namespace: &str, user: &str) -> Result<Value, ApiError> {
         Ok(json!({
             "apiVersion": "v1",
@@ -1807,5 +2138,203 @@ impl Ns4KafkaClient for FakeClient {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn make_jwt(sub: &str, exp: i64, roles: &[&str]) -> String {
+        use base64::Engine as _;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload_json = json!({
+            "sub": sub,
+            "exp": exp,
+            "roles": roles,
+        });
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json.to_string());
+        format!("{header}.{payload}.signature")
+    }
+
+    #[test]
+    fn parses_unexpired_jwt_claims_and_rejects_expired_tokens() {
+        let now = chrono::Utc::now().timestamp();
+        let valid_tok = make_jwt("alice@michelin.com", now + 3600, &["isAdmin()"]);
+        let info = parse_jwt_claims(&valid_tok).expect("valid JWT should parse");
+        assert_eq!(info.username, "alice@michelin.com");
+        assert_eq!(info.roles, vec!["isAdmin()"]);
+        assert!(info.active);
+
+        let expired_tok = make_jwt("alice@michelin.com", now - 60, &[]);
+        assert!(
+            parse_jwt_claims(&expired_tok).is_none(),
+            "expired JWT must be rejected"
+        );
+        assert!(parse_jwt_claims("not-a-jwt").is_none());
+    }
+
+    #[test]
+    fn parses_ns4kafka_status_error_messages_and_causes() {
+        let body = r#"{
+            "status": "Failed",
+            "message": "Invalid resource",
+            "details": {
+                "causes": ["Partition count must be >= 1", "Replication factor invalid"]
+            }
+        }"#;
+        let err = ApiError::from_status(StatusCode::UNPROCESSABLE_ENTITY, body);
+        assert_eq!(err.failure, PollFailure::Server);
+        assert_eq!(err.status, Some(422));
+        assert!(err.message.contains("Invalid resource"));
+        assert!(
+            err.message
+                .contains("Partition count must be >= 1; Replication factor invalid")
+        );
+
+        let unauth = ApiError::from_status(StatusCode::UNAUTHORIZED, "");
+        assert_eq!(unauth.failure, PollFailure::Unauthorized);
+
+        let forb = ApiError::from_status(StatusCode::FORBIDDEN, "Forbidden");
+        assert_eq!(forb.failure, PollFailure::Forbidden);
+    }
+
+    #[tokio::test]
+    async fn http_client_relogs_on_401_and_executes_rest_endpoints_against_mock_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let valid_jwt = make_jwt(
+            "mock-user",
+            chrono::Utc::now().timestamp() + 3600,
+            &["ROLE_USER"],
+        );
+        let server_jwt = valid_jwt.clone();
+
+        // Spawn a lightweight mock ns4kafka HTTP server handling:
+        // 1. First GET /api/app-info/version with stale token -> 401 Unauthorized
+        // 2. POST /login -> 200 OK with fresh JWT
+        // 3. Second GET /api/app-info/version -> 200 OK `{"version":"1.33.0"}`
+        // 4. GET /api/namespaces/team-orders/schemas/orders-value -> 200 OK `[Schema]`
+        // 5. POST /api/namespaces/team-orders/topics?dryrun=true -> 200 OK with X-Ns4kafka-Result header
+        let server = tokio::spawn(async move {
+            let mut saw_first_401 = false;
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or_default();
+
+                let response = if first_line.starts_with("POST /login") {
+                    let body = json!({
+                        "access_token": server_jwt,
+                        "username": "mock-user",
+                        "roles": ["ROLE_USER"],
+                        "expires_in": 3600
+                    })
+                    .to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if first_line.starts_with("GET /api/app-info/version") && !saw_first_401 {
+                    saw_first_401 = true;
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else if first_line.starts_with("GET /api/app-info/version") {
+                    let body = r#"{"version":"1.33.0"}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if first_line
+                    .starts_with("GET /api/namespaces/team-orders/schemas/orders-value")
+                {
+                    let body = json!([{
+                        "apiVersion": "v1",
+                        "kind": "Schema",
+                        "metadata": { "name": "orders-value", "namespace": "team-orders" },
+                        "spec": { "id": 777, "version": 4, "compatibility": "FULL" }
+                    }])
+                    .to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if first_line
+                    .starts_with("POST /api/namespaces/team-orders/topics?dryrun=true")
+                {
+                    let body = json!({
+                        "apiVersion": "v1",
+                        "kind": "Topic",
+                        "metadata": { "name": "orders.v1", "namespace": "team-orders" },
+                        "spec": { "partitions": 6, "replicationFactor": 3 }
+                    })
+                    .to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Ns4kafka-Result: created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let ctx = KafkaContext {
+            name: format!("mock-ctx-{}", std::process::id()),
+            api: format!("http://{addr}"),
+            user_token: "glpat-mock-secret".into(),
+            username: "gitlab".into(),
+            namespace: "team-orders".into(),
+            readonly: false,
+        };
+        let client = HttpClient::new(ctx).unwrap();
+        // Seed an unexpired-looking but server-rejected token so first request hits 401 and triggers re-login
+        *client.jwt.write().unwrap() = Some(make_jwt(
+            "stale",
+            chrono::Utc::now().timestamp() + 3600,
+            &[],
+        ));
+
+        let ver = client.server_version().await.unwrap();
+        assert_eq!(ver, "1.33.0");
+        assert_eq!(client.token_info().await.unwrap().username, "mock-user");
+
+        // Single-element JSON array returned by /schemas/{subject} unwraps to the Schema object
+        let schema = client
+            .get_schema("team-orders", "orders-value")
+            .await
+            .unwrap();
+        assert_eq!(schema.pointer("/spec/id"), Some(&json!(777)));
+
+        // Apply dry-run parses X-Ns4kafka-Result header
+        let topic_def = DiscoveryRegistry::builtin()
+            .find_by_kind("Topic")
+            .unwrap()
+            .clone();
+        let apply_res = client
+            .apply_resource(
+                Some("team-orders"),
+                &topic_def,
+                &json!({"metadata":{"name":"orders.v1"}}),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply_res.status, "created");
+
+        let _ = std::fs::remove_file(jwt_cache_path(&client.context().name));
+        server.await.unwrap();
     }
 }

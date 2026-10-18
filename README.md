@@ -39,7 +39,7 @@ It also suits the job: the Puy de Dôme is a dome, a single view over everything
 
 - **Zero-setup `kafkactl` drop-in:** Reads your existing `~/.kafkactl/config.yml` contexts and reuses `~/.kafkactl/jwt` tokens (or logs in via `POST /login` and caches tokens with `0600` permissions). Trusts system & corporate root CAs out of the box.
 - **One generic object pipeline:** Built around `GET /api-resources` discovery (`Topic`, `Connector`, `ConsumerGroup`, `Schema`, `AccessControlEntry`, `KafkaStream`, `ConnectCluster`, `ResourceQuota`, `RoleBinding`, `Namespace`), with curated columns per kind, JSON-Pointer custom views, and a `NAME / AGE` fallback for any future kind.
-- **Background Schema Registry hydration:** Lists thousands of schema subjects instantaneously and hydrates `VERSION`, `ID`, `COMPATIBILITY`, and `TYPE` in the background (prioritizing rows near your cursor). Press `Enter` for a pretty-printed Avro/JSON/Protobuf schema definition, or `y` for the full ns4kafka YAML resource.
+- **Long-lived persistent cache & background Schema hydration:** Caches all resource views, namespaces, and hydrated Schema Registry specs on disk (`~/.cache/domite/`) with a stale-while-revalidate strategy — tables and 2,000+ schema subjects render instantaneously on startup while the background poller and hydrator refresh live data. Press `Enter` for a pretty-printed Avro/JSON/Protobuf schema definition, or `y` for the full ns4kafka YAML resource.
 - **Explain unhealthy resources (`X`):** Inspect why a `Topic` is in `Fail` phase or view full Java stack traces (`status.tasks[].trace`) for failed `Connector` tasks without leaving the terminal.
 - **Safe writes with server dry-run diffs:** Every mutating action (`e` edit in `$EDITOR`, `Ctrl-d` delete, `i` import, `delete-records`, consumer-group offset `reset`) runs against ns4kafka's `?dryrun=true` endpoint first and shows a unified diff or dry-run preview before confirmation.
 - **Production guardrails:** Any context named `prod*` / `*-prod` defaults to `readonly = true`. Switch to write mode explicitly with `:write` or `--write`.
@@ -87,7 +87,9 @@ Open the command palette with **`:`** and type any kind, plural path, or short a
 |---|---|---|---|
 | `Topic` | `topics`, `topic`, `to` | `NAME`, `PARTITIONS`, `RF`, `TAGS`, `RETENTION`, `STATUS`, `AGE` (`+CLEANUP` in wide mode) | Drill down to `ConsumerGroup` reading this topic |
 | `Connector` | `connectors`, `connect`, `co` | `NAME`, `CONNECT-CLUSTER`, `CLASS`, `STATE`, `TASKS`, `AGE` (`+SYNC-STATUS` in wide mode) | Open `Explain` task traces if failed, else YAML |
-| `ConsumerGroup` | `consumer-groups`, `groups`, `cg` | `NAME`, `STATE`, `TOPIC`, `PARTITION`, `CURRENT-OFFSET`, `END-OFFSET`, `LAG` | View resource YAML |
+| `ConsumerGroup` | `consumer-groups`, `groups`, `cg` | `NAME`, `OWNERSHIP`, `STATE`, `TOPICS`, `PARTITIONS`, `TOTAL-LAG`, `MAX-LAG` | Drill down to `ConsumerGroupMember` partition lag table |
+| `ExternalConsumerGroup` | `cg-ext`, `ext-cg`, `external-groups` | `NAME`, `OWNERSHIP`, `STATE`, `TOPICS`, `PARTITIONS`, `TOTAL-LAG`, `MAX-LAG` | Drill down to `ConsumerGroupMember` partition lag table |
+| `ConsumerGroupMember` | *(via `Enter` on a group)* | `GROUP`, `STATE`, `TOPIC`, `PARTITION`, `CURRENT-OFFSET`, `END-OFFSET`, `LAG` | Open `Explain` lag & reset readiness view |
 | `Schema` | `schemas`, `schema`, `sc` | `SUBJECT`, `VERSION`, `ID`, `COMPATIBILITY` (`+TYPE` in wide mode) | Open pretty-printed Avro / JSON / Protobuf schema |
 | `AccessControlEntry` | `acls`, `acl`, `ac` | `NAME`, `GRANTED-TO`, `RESOURCE-TYPE`, `RESOURCE`, `PATTERN`, `PERMISSION` | View resource YAML |
 | `ConnectCluster` | `connect-clusters`, `cc`, `kc` | `NAME`, `URL`, `AGE` (`+STATUS` in wide mode) | Drill down to `Connector` deployed on this cluster |
@@ -149,7 +151,7 @@ Press **`/`** in any table view to filter rows live:
 
 - **Topic:** Jump to Consumer Groups / ACLs / Schemas, inspect `/spec/configs`, delete records (truncate with dry-run preview), import unsynchronized topics.
 - **Connector:** Restart / Pause / Resume / Stop (single or bulk marked connectors), view offsets, reset offsets, import unsynchronized connectors.
-- **ConsumerGroup:** Reset offsets (`TO_EARLIEST`, `TO_LATEST`, `TO_DATETIME`, `TO_OFFSET`, `SHIFT_BY` — all with partition/offset dry-run preview), delete consumer group.
+- **ConsumerGroup:** View partition offsets & lag (`Enter`), jump to consumed topic, reset offsets (`TO_EARLIEST`, `TO_LATEST`, `TO_DATETIME`, `BY_DURATION`, `TO_OFFSET`, `SHIFT_BY` — for an entire group, a single topic, or a specific `topic:partition`, all with server dry-run preview), delete consumer group.
 - **Schema:** Set compatibility (`BACKWARD`, `BACKWARD_TRANSITIVE`, `FORWARD`, `FORWARD_TRANSITIVE`, `FULL`, `FULL_TRANSITIVE`, `NONE`) or reset to `GLOBAL`.
 - **ConnectCluster:** Encrypt secrets via Vault (`POST .../connect-clusters/{cc}/vaults`), jump to connectors.
 - **Namespace:** Switch active namespace, reset Kafka user password (displayed once in a modal popup, never written to logs).
@@ -164,6 +166,7 @@ Optional UI preferences, per-context overrides, and custom JSON-Pointer table vi
 
 ```toml
 poll_interval_secs = 5
+schema_cache_ttl_hours = 24
 min_server_version = "1.20.0"
 
 [skin]

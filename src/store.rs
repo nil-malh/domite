@@ -145,8 +145,8 @@ pub fn row_key(obj: &Value) -> String {
         .unwrap_or("<unknown>");
     let kind = obj.get("kind").and_then(Value::as_str).unwrap_or_default();
 
-    // ConsumerGroup rows are per (group, topic, partition)
-    if kind == "ConsumerGroup"
+    // ConsumerGroupMember rows (or partition-level items) are per (group, topic, partition)
+    if kind == "ConsumerGroupMember"
         || obj.pointer("/status/topic").is_some() && obj.pointer("/status/partition").is_some()
     {
         let topic = obj

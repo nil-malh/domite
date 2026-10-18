@@ -109,7 +109,7 @@ jobs:
           PKG="domite-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/${PKG}/completions"
           cp "target/${{ matrix.target }}/release/domite" "dist/${PKG}/"
-          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${PKG}/"
+          cp README.md LICENSE "dist/${PKG}/"
           if "dist/${PKG}/domite" --version >/dev/null 2>&1; then
             "dist/${PKG}/domite" --completions bash > "dist/${PKG}/completions/domite.bash"
             "dist/${PKG}/domite" --completions zsh > "dist/${PKG}/completions/_domite"
@@ -127,7 +127,7 @@ jobs:
           $Pkg = "domite-$Tag-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$Pkg/completions" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/domite.exe" "dist/$Pkg/"
-          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE "dist/$Pkg/"
+          Copy-Item README.md LICENSE "dist/$Pkg/"
           & "dist/$Pkg/domite.exe" --completions powershell > "dist/$Pkg/completions/_domite.ps1"
           Compress-Archive -Path "dist/$Pkg" -DestinationPath "dist/$Pkg.zip"
           $Hash = (Get-FileHash "dist/$Pkg.zip" -Algorithm SHA256).Hash.ToLower()

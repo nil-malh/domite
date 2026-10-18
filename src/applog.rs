@@ -63,6 +63,11 @@ fn log(level: &str, event: &str, fields: &[(&str, &str)]) {
     let Some(tx) = LOGGER.get() else {
         return;
     };
+    let line = format_log_line(level, event, fields);
+    let _ = tx.try_send(line);
+}
+
+pub fn format_log_line(level: &str, event: &str, fields: &[(&str, &str)]) -> String {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut line = format!("ts={ts} level={level} event={event}");
     for (k, v) in fields {
@@ -80,5 +85,29 @@ fn log(level: &str, event: &str, fields: &[(&str, &str)]) {
             line.push_str(&safe);
         }
     }
-    let _ = tx.try_send(line);
+    line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_logfmt_lines_and_redacts_secrets_and_ips() {
+        let line = format_log_line(
+            "info",
+            "login",
+            &[
+                ("context", "prod"),
+                ("user_token", "glpat-1234567890abcdef"),
+                ("msg", "dial 10.20.30.40:443 with Bearer secret-jwt"),
+            ],
+        );
+        assert!(line.contains("level=info event=login"));
+        assert!(line.contains("context=prod"));
+        assert!(line.contains(&format!("user_token={}", redact::REDACTED)));
+        assert!(!line.contains("glpat-1234567890abcdef"));
+        assert!(!line.contains("10.20.30.40"));
+        assert!(!line.contains("secret-jwt"));
+    }
 }

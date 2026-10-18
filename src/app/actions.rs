@@ -50,6 +50,13 @@ pub enum MenuOp {
     },
     ConnectorImportUnsynced,
     // ConsumerGroup actions
+    ConsumerGroupDrillPartitions {
+        group: String,
+        ownership: String,
+    },
+    ConsumerGroupJumpTopic {
+        topic: String,
+    },
     ConsumerGroupReset {
         group: String,
         topic: String,
@@ -207,25 +214,76 @@ pub fn menu_for_resource(
             });
             items
         }
-        "ConsumerGroup" => {
+        "ConsumerGroup" | "ExternalConsumerGroup" | "ConsumerGroupMember" => {
             if name.is_empty() {
                 return Vec::new();
             }
-            let topic = selected_obj
-                .and_then(|v| v.pointer("/status/topic"))
+            let ownership = selected_obj
+                .and_then(|v| v.get("_cgOwnership"))
                 .and_then(Value::as_str)
-                .unwrap_or("*")
+                .unwrap_or("Owned")
                 .to_string();
-            vec![
+
+            // In ConsumerGroupMember view, the user can reset either the exact `topic:partition`,
+            // the whole `topic`, or all topics `*`. In the summary ConsumerGroup view, default to
+            // the single topic if only 1 topic is consumed, or `*` otherwise.
+            let status_topic = selected_obj
+                .and_then(|v| v.pointer("/status/topic"))
+                .and_then(Value::as_str);
+            let status_part = selected_obj
+                .and_then(|v| v.pointer("/status/partition"))
+                .and_then(Value::as_i64);
+            let cg_topics = selected_obj
+                .and_then(|v| v.get("_cgTopics"))
+                .and_then(Value::as_str)
+                .unwrap_or("*");
+
+            let default_topic = if let (Some(t), Some(p)) = (status_topic, status_part) {
+                format!("{t}:{p}")
+            } else if let Some(t) = status_topic {
+                t.to_string()
+            } else if !cg_topics.is_empty() && cg_topics != "-" && !cg_topics.contains(',') {
+                cg_topics.to_string()
+            } else {
+                "*".to_string()
+            };
+
+            let mut entries = Vec::new();
+            if kind != "ConsumerGroupMember" {
+                entries.push(MenuEntry {
+                    label: "View Partition Offsets & Lag".into(),
+                    description: format!("Drill down into partition offsets for '{name}'"),
+                    mutating: false,
+                    op: MenuOp::ConsumerGroupDrillPartitions {
+                        group: name.clone(),
+                        ownership: ownership.clone(),
+                    },
+                });
+            }
+            if let Some(t) = status_topic.or_else(|| {
+                (!cg_topics.is_empty() && cg_topics != "-" && !cg_topics.contains(','))
+                    .then_some(cg_topics)
+            }) {
+                entries.push(MenuEntry {
+                    label: format!("Jump to Topic ({t})"),
+                    description: format!("Inspect topic '{t}'"),
+                    mutating: false,
+                    op: MenuOp::ConsumerGroupJumpTopic {
+                        topic: t.to_string(),
+                    },
+                });
+            }
+
+            entries.extend([
                 MenuEntry {
                     label: "Reset Offsets → TO_EARLIEST".into(),
                     description: format!(
-                        "Reset '{name}' on '{topic}' to earliest offset (dry-run preview)"
+                        "Reset '{name}' on '{default_topic}' to earliest offset (dry-run preview)"
                     ),
                     mutating: true,
                     op: MenuOp::ConsumerGroupReset {
                         group: name.clone(),
-                        topic: topic.clone(),
+                        topic: default_topic.clone(),
                         method: "TO_EARLIEST".into(),
                         needs_input: None,
                     },
@@ -233,45 +291,64 @@ pub fn menu_for_resource(
                 MenuEntry {
                     label: "Reset Offsets → TO_LATEST".into(),
                     description: format!(
-                        "Reset '{name}' on '{topic}' to latest offset (dry-run preview)"
+                        "Reset '{name}' on '{default_topic}' to latest offset (dry-run preview)"
                     ),
                     mutating: true,
                     op: MenuOp::ConsumerGroupReset {
                         group: name.clone(),
-                        topic: topic.clone(),
+                        topic: default_topic.clone(),
                         method: "TO_LATEST".into(),
                         needs_input: None,
                     },
                 },
                 MenuEntry {
                     label: "Reset Offsets → TO_DATETIME".into(),
-                    description: "Reset to ISO-8601 timestamp (yyyy-MM-ddTHH:mm:ss.SSS)".into(),
+                    description: format!(
+                        "Reset '{default_topic}' to ISO-8601 timestamp (yyyy-MM-ddTHH:mm:ss.SSS)"
+                    ),
                     mutating: true,
                     op: MenuOp::ConsumerGroupReset {
                         group: name.clone(),
-                        topic: topic.clone(),
+                        topic: default_topic.clone(),
                         method: "TO_DATETIME".into(),
-                        needs_input: Some("Enter datetime (e.g. 2026-10-14T12:00:00.000):".into()),
+                        needs_input: Some(
+                            "Enter ISO-8601 datetime (e.g. 2026-10-14T12:00:00.000Z):".into(),
+                        ),
+                    },
+                },
+                MenuEntry {
+                    label: "Reset Offsets → BY_DURATION".into(),
+                    description: format!(
+                        "Rewind '{default_topic}' by ISO-8601 duration (e.g. PT2H, PT30M, P1D)"
+                    ),
+                    mutating: true,
+                    op: MenuOp::ConsumerGroupReset {
+                        group: name.clone(),
+                        topic: default_topic.clone(),
+                        method: "BY_DURATION".into(),
+                        needs_input: Some(
+                            "Enter ISO-8601 duration (e.g. PT2H, PT30M, P1D):".into(),
+                        ),
                     },
                 },
                 MenuEntry {
                     label: "Reset Offsets → TO_OFFSET".into(),
-                    description: "Reset to an explicit numeric offset".into(),
+                    description: format!("Reset '{default_topic}' to an explicit numeric offset"),
                     mutating: true,
                     op: MenuOp::ConsumerGroupReset {
                         group: name.clone(),
-                        topic: topic.clone(),
+                        topic: default_topic.clone(),
                         method: "TO_OFFSET".into(),
-                        needs_input: Some("Enter target offset number:".into()),
+                        needs_input: Some("Enter target offset number (>= 0):".into()),
                     },
                 },
                 MenuEntry {
                     label: "Reset Offsets → SHIFT_BY".into(),
-                    description: "Shift current offset by +/- N records".into(),
+                    description: format!("Shift '{default_topic}' offset by +/- N records"),
                     mutating: true,
                     op: MenuOp::ConsumerGroupReset {
                         group: name.clone(),
-                        topic,
+                        topic: default_topic,
                         method: "SHIFT_BY".into(),
                         needs_input: Some("Enter offset shift (+/- integer):".into()),
                     },
@@ -282,7 +359,8 @@ pub fn menu_for_resource(
                     mutating: true,
                     op: MenuOp::ConsumerGroupDelete { group: name },
                 },
-            ]
+            ]);
+            entries
         }
         "Schema" => {
             if name.is_empty() {

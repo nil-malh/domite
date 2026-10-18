@@ -15,6 +15,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
+use crate::api::cache::PersistentCache;
 use crate::api::client::Ns4KafkaClient;
 use crate::api::config::{KafkaContext, LoadedConfig};
 use crate::api::discovery::{DiscoveryRegistry, ResourceDefinition};
@@ -161,6 +162,7 @@ pub struct EditorRequest {
 pub struct App {
     pub config: LoadedConfig,
     pub client: Arc<dyn Ns4KafkaClient>,
+    pub cache: PersistentCache,
     pub registry: DiscoveryRegistry,
     pub store: Store,
     pub generation: u64,
@@ -203,6 +205,7 @@ impl App {
     pub fn new(
         config: LoadedConfig,
         client: Arc<dyn Ns4KafkaClient>,
+        cache: PersistentCache,
         initial_resource: Option<&str>,
         namespace_override: Option<String>,
         readonly_override: Option<bool>,
@@ -249,9 +252,10 @@ impl App {
             None
         };
 
-        let mut namespaces = Vec::new();
+        let mut namespaces = cache.load_namespaces(&active_context).unwrap_or_default();
         if let Some(ns) = &active_namespace
             && ns != "*"
+            && !namespaces.iter().any(|(n, _)| n == ns)
         {
             namespaces.push((ns.clone(), false));
         }
@@ -259,6 +263,7 @@ impl App {
         let mut app = Self {
             config,
             client,
+            cache,
             registry,
             store: Store::default(),
             generation: 1,
@@ -294,10 +299,25 @@ impl App {
             poll_target_tx,
             force_poll_tx,
         };
+        app.seed_store_from_cache();
         app.apply_default_view_sort();
         app.rebuild_rows();
         app.update_poller_target();
         app
+    }
+
+    /// Seed `self.store` from the persistent cache for the active `(context, namespace, resource)`
+    /// so rows appear immediately while the background poller revalidates.
+    fn seed_store_from_cache(&mut self) {
+        if let Some(seeded) = self.cache.load_view_items(
+            &self.active_context,
+            self.active_namespace.as_deref(),
+            &self.active_resource.path,
+        ) {
+            self.store.seed(seeded);
+        } else {
+            self.store.clear();
+        }
     }
 
     /// Effective read-only status for the active context.
@@ -310,6 +330,13 @@ impl App {
 
     pub fn all_namespaces(&self) -> bool {
         self.active_namespace.as_deref().is_none_or(|ns| ns == "*")
+    }
+
+    pub fn demo_or_fast_hydrate(&self) -> bool {
+        matches!(
+            self.active_resource.kind.as_str(),
+            "Schema" | "ConsumerGroup"
+        )
     }
 
     /// Spawn initial discovery (`/api-resources`, `/api/app-info/version`, `/token_info`, `/api/namespaces`).
@@ -347,6 +374,7 @@ impl App {
             resource: self.active_resource.clone(),
             interval,
             cursor_hint: self.cursor_hint.clone(),
+            cache: self.cache.clone(),
         };
         let _ = self.poll_target_tx.send(Some(target));
     }
@@ -454,6 +482,7 @@ impl App {
                         }
                     }
                     merged.sort_by(|a, b| a.0.cmp(&b.0));
+                    self.cache.save_namespaces(&self.active_context, &merged);
                     self.namespaces = merged;
                 }
             }
@@ -941,9 +970,13 @@ impl App {
         }
     }
 
-    /// Returns `(hydrated_count, total_count)` when background schema hydration is in flight.
+    /// Returns `(hydrated_count, total_count)` when background schema or consumer-group hydration is in flight.
     pub fn hydrating_progress(&self) -> Option<(usize, usize)> {
-        if self.active_resource.kind != "Schema" || self.store.is_empty() {
+        if !matches!(
+            self.active_resource.kind.as_str(),
+            "Schema" | "ConsumerGroup"
+        ) || self.store.is_empty()
+        {
             return None;
         }
         let total = self.store.len();
@@ -969,6 +1002,11 @@ impl App {
             map.remove("_quotaValue");
             map.remove("_quotaUsed");
             map.remove("_hydrating");
+            map.remove("_cgOwnership");
+            map.remove("_cgTopics");
+            map.remove("_cgPartitions");
+            map.remove("_cgTotalLag");
+            map.remove("_cgMaxLag");
         }
         // Redact sensitive fields in ConnectCluster specs (`password`, `aes256Key`, `aes256Salt`)
         crate::redact::redact_json(&mut display_obj);
@@ -1024,6 +1062,8 @@ impl App {
             .to_string();
         let key = crate::store::row_key(obj);
         let client = self.client.clone();
+        let cache = self.cache.clone();
+        let ctx_name = self.active_context.clone();
         let tx = self.msg_tx.clone();
         let r#gen = self.generation;
         self.flash = Some((
@@ -1033,6 +1073,7 @@ impl App {
         tokio::spawn(async move {
             match client.get_schema(&ns, &subject).await {
                 Ok(full) => {
+                    cache.put_schema(&ctx_name, key.clone(), full.clone(), true);
                     let _ = tx.send(Msg::Applied {
                         generation: r#gen,
                         key,
@@ -1325,36 +1366,108 @@ impl App {
             }
         }
 
-        // 3. ConsumerGroup lag and state
-        if kind == "ConsumerGroup" {
+        // 3. ConsumerGroup / ExternalConsumerGroup / ConsumerGroupMember lag and state
+        if matches!(
+            kind.as_str(),
+            "ConsumerGroup" | "ExternalConsumerGroup" | "ConsumerGroupMember"
+        ) {
             let state = obj
                 .pointer("/status/state")
                 .and_then(Value::as_str)
                 .unwrap_or("UNKNOWN");
-            let topic = obj
-                .pointer("/status/topic")
+            let ownership = obj
+                .get("_cgOwnership")
                 .and_then(Value::as_str)
-                .unwrap_or("-");
-            let part = obj
-                .pointer("/status/partition")
+                .unwrap_or("Owned");
+            let total_lag = obj
+                .get("_cgTotalLag")
+                .or_else(|| obj.pointer("/status/lag"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
-            let lag = obj
-                .pointer("/status/lag")
+            let max_lag = obj
+                .get("_cgMaxLag")
+                .or_else(|| obj.pointer("/status/lag"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
+
             let sev = if state == "DEAD" {
                 FindingSeverity::Error
-            } else if lag > 0 || state != "STABLE" {
+            } else if total_lag > 0 || state != "STABLE" {
                 FindingSeverity::Warning
             } else {
                 FindingSeverity::Ok
             };
+
+            let reset_note = if state == "EMPTY" || state == "DEAD" {
+                "Group is inactive (EMPTY/DEAD): offset reset and group deletion are allowed."
+            } else {
+                "Group has active consumers (STABLE/REBALANCING): stop consumers until state is EMPTY before resetting offsets or deleting."
+            };
+
             findings.push(ExplainFinding {
                 severity: sev,
-                heading: format!("Consumer Group State: {state} ({topic}:{part})"),
-                detail: vec![format!("Partition lag: {lag} record(s)")],
+                heading: format!(
+                    "Consumer Group State: {state} ({ownership}, total lag: {total_lag}, max partition lag: {max_lag})"
+                ),
+                detail: vec![reset_note.to_string()],
             });
+
+            if let Some(items) = obj.get("_cgItems").and_then(Value::as_array) {
+                for item in items {
+                    let topic = item
+                        .pointer("/status/topic")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-");
+                    let part = item
+                        .pointer("/status/partition")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let cur = item
+                        .pointer("/status/currentOffset")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let end = item
+                        .pointer("/status/logEndOffset")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let lag = item
+                        .pointer("/status/lag")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let psev = if lag > 0 {
+                        FindingSeverity::Warning
+                    } else {
+                        FindingSeverity::Ok
+                    };
+                    findings.push(ExplainFinding {
+                        severity: psev,
+                        heading: format!("Partition {topic}:{part} — Lag: {lag}"),
+                        detail: vec![format!("Current Offset: {cur}  |  Log End Offset: {end}")],
+                    });
+                }
+            } else if let Some(topic) = obj.pointer("/status/topic").and_then(Value::as_str) {
+                let part = obj
+                    .pointer("/status/partition")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let cur = obj
+                    .pointer("/status/currentOffset")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let end = obj
+                    .pointer("/status/logEndOffset")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                findings.push(ExplainFinding {
+                    severity: if total_lag > 0 {
+                        FindingSeverity::Warning
+                    } else {
+                        FindingSeverity::Ok
+                    },
+                    heading: format!("Partition {topic}:{part} — Lag: {total_lag}"),
+                    detail: vec![format!("Current Offset: {cur}  |  Log End Offset: {end}")],
+                });
+            }
         }
 
         if findings.is_empty() {
@@ -1393,9 +1506,28 @@ impl App {
             "Topic" => {
                 // Drill down from Topic -> ConsumerGroup filtered by topic name
                 if let Some(cg_def) = self.registry.find_by_kind("ConsumerGroup").cloned() {
-                    let filter = format!("topic={}", row.name);
+                    let filter = format!("topics={}", row.name);
                     self.navigate_to(cg_def, self.active_namespace.clone(), filter, true);
                 }
+            }
+            "ConsumerGroup" | "ExternalConsumerGroup" => {
+                let ownership = self
+                    .selected_object()
+                    .and_then(|v| v.get("_cgOwnership"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Owned")
+                    .to_string();
+                let member_def =
+                    crate::api::discovery::consumer_group_member_definition(&row.name, &ownership);
+                self.navigate_to(
+                    member_def,
+                    self.active_namespace.clone(),
+                    String::new(),
+                    true,
+                );
+            }
+            "ConsumerGroupMember" => {
+                self.open_explain_view();
             }
             "ConnectCluster" => {
                 // Drill down from ConnectCluster -> Connector filtered by connect-cluster
@@ -1450,7 +1582,7 @@ impl App {
         self.marked.clear();
         self.poll_error = None;
         self.generation += 1;
-        self.store.clear();
+        self.seed_store_from_cache();
         self.rebuild_rows();
         self.update_poller_target();
     }
@@ -1494,7 +1626,7 @@ impl App {
         self.marked.clear();
         self.poll_error = None;
         self.generation += 1;
-        self.store.clear();
+        self.seed_store_from_cache();
         self.rebuild_rows();
         self.update_poller_target();
     }
@@ -1533,13 +1665,17 @@ impl App {
         self.active_namespace = Some(ctx.namespace.clone());
         self.username = Some(ctx.username.clone());
         self.forbidden_namespaces.clear();
-        self.namespaces = vec![(ctx.namespace.clone(), false)];
+        let mut cached_ns = self.cache.load_namespaces(&ctx.name).unwrap_or_default();
+        if !cached_ns.iter().any(|(n, _)| n == &ctx.namespace) {
+            cached_ns.push((ctx.namespace.clone(), false));
+        }
+        self.namespaces = cached_ns;
         self.history_back.clear();
         self.history_forward.clear();
         self.marked.clear();
         self.poll_error = None;
         self.generation += 1;
-        self.store.clear();
+        self.seed_store_from_cache();
         self.mode = Mode::Table;
         self.flash = Some((
             format!(
@@ -2290,7 +2426,7 @@ impl App {
     fn handle_sort_picker_key(&mut self, input: KeyInput, selected: &mut usize) {
         let count = self.columns.len();
         match input.action {
-            Some(Action::Back) => self.mode = Mode::Table,
+            Some(Action::Back | Action::Close) => self.mode = Mode::Table,
             Some(Action::Down) if count > 0 => {
                 *selected = (*selected + 1) % count;
                 self.mode = Mode::SortPicker {
@@ -2467,6 +2603,16 @@ impl App {
                     },
                     self.msg_tx.clone(),
                 );
+            }
+            MenuOp::ConsumerGroupDrillPartitions { group, ownership } => {
+                let member_def =
+                    crate::api::discovery::consumer_group_member_definition(&group, &ownership);
+                self.navigate_to(member_def, Some(ns), String::new(), true);
+            }
+            MenuOp::ConsumerGroupJumpTopic { topic } => {
+                if let Some(def) = self.registry.find_by_kind("Topic").cloned() {
+                    self.navigate_to(def, Some(ns), topic, true);
+                }
             }
             MenuOp::ConsumerGroupReset {
                 group,

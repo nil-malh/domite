@@ -39,10 +39,15 @@ jobs:
       - name: Run unit & integration tests
         run: cargo test --locked
 
-      - name: Run headless smoke checks (--demo --check & --demo --snapshot)
+      - name: Run headless smoke checks (--demo --check, --snapshot, --completions)
         run: |
           cargo run --locked -- --demo --check
           cargo run --locked -- --demo --snapshot
+          cargo run --locked -- --demo connectors --snapshot
+          cargo run --locked -- --demo schemas --snapshot
+          cargo run --locked -- --demo cg --snapshot
+          cargo run --locked -- --demo quotas --snapshot
+          cargo run --locked -- --completions bash > /dev/null
 
       - name: Verify crate packaging (dry-run)
         if: matrix.os == 'ubuntu-latest'

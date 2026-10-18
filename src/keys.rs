@@ -181,5 +181,22 @@ mod tests {
         let bt = KeyChord::parse("shift-tab").unwrap();
         assert_eq!(bt.code, KeyCode::BackTab);
         assert!(!bt.shift);
+
+        let fkey = KeyChord::parse("alt-shift-f5").unwrap();
+        assert_eq!(fkey.code, KeyCode::F(5));
+        assert!(fkey.alt && fkey.shift && !fkey.ctrl);
+        assert_eq!(fkey.label(), "alt-shift-f5");
+
+        let shifted_letter = KeyChord::parse("shift-s").unwrap();
+        assert_eq!(shifted_letter.code, KeyCode::Char('S'));
+        assert!(!shifted_letter.shift);
+        assert!(shifted_letter.matches(&KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)));
+        assert!(!shifted_letter.matches(&KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)));
+
+        // Reject invalid chords
+        assert!(KeyChord::parse("").is_err());
+        assert!(KeyChord::parse("unknownmod-a").is_err());
+        assert!(KeyChord::parse("ctrl-unknownkey").is_err());
+        assert!(KeyChord::parse("shift--").is_err());
     }
 }

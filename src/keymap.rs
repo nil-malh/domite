@@ -236,8 +236,9 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("namespaces", Action::Up, &["up", "ctrl-p", "backtab"]),
     ("contexts", Action::Down, &["down", "ctrl-n", "tab"]),
     ("contexts", Action::Up, &["up", "ctrl-p", "backtab"]),
-    ("sort_picker", Action::Down, &["down", "ctrl-n", "tab"]),
-    ("sort_picker", Action::Up, &["up", "ctrl-p", "backtab"]),
+    ("sort_picker", Action::Down, &["down", "ctrl-n", "tab", "j"]),
+    ("sort_picker", Action::Up, &["up", "ctrl-p", "backtab", "k"]),
+    ("sort_picker", Action::Close, &["q"]),
 ];
 
 impl Default for Keymap {

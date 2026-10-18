@@ -31,6 +31,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, watch};
 
+use crate::api::cache::PersistentCache;
 use crate::api::client::{FakeClient, HttpClient, Ns4KafkaClient};
 use crate::api::config::{KafkaContext, LoadedConfig};
 use crate::api::discovery::DiscoveryRegistry;
@@ -144,9 +145,17 @@ async fn main() -> anyhow::Result<()> {
     let (poll_target_tx, poll_target_rx) = watch::channel::<Option<PollTarget>>(None);
     let (force_poll_tx, force_poll_rx) = mpsc::unbounded_channel();
 
+    let schema_ttl_secs = (loaded.domite.schema_cache_ttl_hours as i64) * 3600;
+    let cache = if cli.demo {
+        PersistentCache::in_memory(schema_ttl_secs)
+    } else {
+        PersistentCache::new(PersistentCache::default_cache_dir(), schema_ttl_secs)
+    };
+
     let mut app = App::new(
         loaded,
         client,
+        cache,
         cli.resource.as_deref(),
         namespace_override,
         readonly_override,
@@ -259,6 +268,9 @@ async fn run_headless_snapshot(
         let mut prev = std::collections::HashMap::new();
         let mut first = true;
         poll_once(&target, &mut prev, &mut first, msg_tx).await;
+    }
+    if app.demo_or_fast_hydrate() {
+        tokio::time::sleep(Duration::from_millis(30)).await;
     }
     let mut batch = Vec::new();
     while let Ok(msg) = msg_rx.try_recv() {
@@ -377,4 +389,57 @@ fn suspend_and_edit(
     }
     let _ = std::fs::remove_file(&tmp_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_command_factory_and_argument_parsing_are_valid() {
+        Cli::command().debug_assert();
+
+        let cli = Cli::try_parse_from([
+            "domite",
+            "connectors",
+            "-c",
+            "oom-cqt",
+            "-n",
+            "coomgbl0",
+            "--readonly",
+            "--skin",
+            "nord",
+            "--demo",
+        ])
+        .unwrap();
+        assert_eq!(cli.resource.as_deref(), Some("connectors"));
+        assert_eq!(cli.context.as_deref(), Some("oom-cqt"));
+        assert_eq!(cli.namespace.as_deref(), Some("coomgbl0"));
+        assert!(cli.readonly);
+        assert!(!cli.write);
+        assert_eq!(cli.skin.as_deref(), Some("nord"));
+        assert!(cli.demo);
+
+        // --readonly and --write are mutually exclusive
+        assert!(Cli::try_parse_from(["domite", "--readonly", "--write"]).is_err());
+    }
+
+    #[test]
+    fn generates_non_empty_shell_completions_for_all_shells() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::Elvish,
+            Shell::PowerShell,
+        ] {
+            let mut cmd = Cli::command();
+            let mut buf = Vec::new();
+            clap_complete::generate(shell, &mut cmd, "domite", &mut buf);
+            assert!(
+                !buf.is_empty(),
+                "shell completion for {shell:?} should not be empty"
+            );
+        }
+    }
 }

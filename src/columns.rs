@@ -252,8 +252,17 @@ pub fn builtin_columns(kind: &str) -> Vec<ColumnSpec> {
             ),
             col_ptr("PERMISSION", "/spec/permission", ColumnKind::Text, false),
         ],
-        "ConsumerGroup" => vec![
+        "ConsumerGroup" | "ExternalConsumerGroup" => vec![
             col_ptr("NAME", "/metadata/name", ColumnKind::Text, false),
+            col_ptr("OWNERSHIP", "/_cgOwnership", ColumnKind::Text, false),
+            col_ptr("STATE", "/status/state", ColumnKind::Status, false),
+            col_ptr("TOPICS", "/_cgTopics", ColumnKind::Text, false),
+            col_ptr("PARTITIONS", "/_cgPartitions", ColumnKind::Number, false),
+            col_ptr("TOTAL-LAG", "/_cgTotalLag", ColumnKind::Number, false),
+            col_ptr("MAX-LAG", "/_cgMaxLag", ColumnKind::Number, false),
+        ],
+        "ConsumerGroupMember" => vec![
+            col_ptr("GROUP", "/metadata/name", ColumnKind::Text, false),
             col_ptr("STATE", "/status/state", ColumnKind::Status, false),
             col_ptr("TOPIC", "/status/topic", ColumnKind::Text, false),
             col_ptr("PARTITION", "/status/partition", ColumnKind::Number, false),
@@ -385,7 +394,7 @@ pub fn eval_column(spec: &ColumnSpec, obj: &Value, now: DateTime<Utc>) -> (Strin
                     .join(","),
                 _ => {
                     if obj.get("_hydrating").and_then(Value::as_bool) == Some(true)
-                        && ptr.starts_with("/spec/")
+                        && (ptr.starts_with("/spec/") || ptr.starts_with("/_cg"))
                     {
                         "…".into()
                     } else {
@@ -751,5 +760,151 @@ mod tests {
             "FAILED",
             "connector with a failed task should highlight as FAILED"
         );
+    }
+
+    #[test]
+    fn evaluates_wide_mode_all_namespaces_and_user_view_overrides() {
+        let now = DateTime::parse_from_rfc3339("2026-10-14T22:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let topic = json!({
+            "apiVersion": "v1",
+            "kind": "Topic",
+            "metadata": {
+                "name": "orders.v1",
+                "namespace": "team-orders",
+                "creationTimestamp": "2026-10-14T21:59:30Z",
+                "labels": { "env": "dev", "tier": "gold" },
+                "status": { "phase": "Success" }
+            },
+            "spec": {
+                "partitions": 12,
+                "replicationFactor": 3,
+                "tags": ["CORE"],
+                "configs": {
+                    "cleanup.policy": "compact",
+                    "retention.ms": "-1",
+                    "min.insync.replicas": "2"
+                }
+            }
+        });
+
+        // 1. All-namespaces + wide mode includes NAMESPACE and CLEANUP
+        let wide_cols = columns_for_kind("Topic", "topics", true, true, true, &HashMap::new());
+        let headers: Vec<&str> = wide_cols.iter().map(|c| c.header.as_str()).collect();
+        assert_eq!(
+            headers,
+            vec![
+                "NAMESPACE",
+                "NAME",
+                "PARTITIONS",
+                "RF",
+                "TAGS",
+                "RETENTION",
+                "STATUS",
+                "CLEANUP",
+                "AGE"
+            ]
+        );
+        let cells: Vec<String> = wide_cols
+            .iter()
+            .map(|c| eval_column(c, &topic, now).0)
+            .collect();
+        assert_eq!(cells[0], "team-orders");
+        assert_eq!(cells[5], "infinite"); // retention.ms = -1
+        assert_eq!(cells[7], "compact");
+        assert_eq!(cells[8], "30s");
+
+        // 2. User view overlay (replace = false) appends custom column
+        let mut views = HashMap::new();
+        views.insert(
+            "topics".to_string(),
+            ViewConfig {
+                replace: false,
+                sort: Some("PARTITIONS".into()),
+                sort_desc: true,
+                columns: vec![crate::api::config::UserColumnConfig {
+                    name: "min-isr".into(),
+                    path: "/spec/configs/min.insync.replicas".into(),
+                    kind: Some("number".into()),
+                    wide: false,
+                }],
+            },
+        );
+        let overlay_cols = columns_for_kind("Topic", "topics", true, false, false, &views);
+        assert_eq!(overlay_cols.last().unwrap().header, "MIN-ISR");
+        assert_eq!(
+            eval_column(overlay_cols.last().unwrap(), &topic, now),
+            ("2".to_string(), SortKey::Num(2.0))
+        );
+
+        // 3. User view replacement (replace = true) replaces built-in columns entirely
+        views.get_mut("topics").unwrap().replace = true;
+        let replaced_cols = columns_for_kind("Topic", "topics", true, false, false, &views);
+        assert_eq!(replaced_cols.len(), 1);
+        assert_eq!(replaced_cols[0].header, "MIN-ISR");
+
+        // 4. Unknown resource kind falls back to NAME + AGE
+        let unknown_cols = columns_for_kind(
+            "CustomKind",
+            "customs",
+            false,
+            false,
+            false,
+            &HashMap::new(),
+        );
+        let unknown_headers: Vec<&str> = unknown_cols.iter().map(|c| c.header.as_str()).collect();
+        assert_eq!(unknown_headers, vec!["NAME", "AGE"]);
+
+        // 5. Labels and tags extraction
+        let labels = extract_labels(&topic);
+        assert_eq!(labels.get("env").map(String::as_str), Some("dev"));
+        assert_eq!(labels.get("tag").map(String::as_str), Some("CORE"));
+    }
+
+    #[test]
+    fn formats_ages_retentions_and_quota_fields_across_ranges() {
+        assert_eq!(format_age(45), "45s");
+        assert_eq!(format_age(180), "3m");
+        assert_eq!(format_age(3600 + 1800), "1h30m");
+        assert_eq!(format_age(12 * 3600), "12h");
+        assert_eq!(format_age(2 * 86_400 + 5 * 3600), "2d5h");
+        assert_eq!(format_age(15 * 86_400), "15d");
+
+        assert_eq!(format_retention_ms(500), "500ms");
+        assert_eq!(format_retention_ms(45_000), "45s");
+        assert_eq!(format_retention_ms(180_000), "3m");
+        assert_eq!(format_retention_ms(5_400_000), "1h30m");
+        assert_eq!(format_retention_ms(86_400_000 * 7), "7d");
+
+        let now = Utc::now();
+        let raw_quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "q1" },
+            "spec": { "count/topics": "25" }
+        });
+        let q_cols = columns_for_kind(
+            "ResourceQuota",
+            "resource-quotas",
+            true,
+            false,
+            false,
+            &HashMap::new(),
+        );
+        assert_eq!(eval_column(&q_cols[1], &raw_quota, now).0, "count/topics");
+        assert_eq!(eval_column(&q_cols[2], &raw_quota, now).0, "25");
+        assert_eq!(eval_column(&q_cols[3], &raw_quota, now).0, "-");
+
+        // Hydrating schema placeholder shows `…`
+        let hydrating_schema = json!({
+            "apiVersion": "v1",
+            "kind": "Schema",
+            "metadata": { "name": "subj-value" },
+            "_hydrating": true
+        });
+        let s_cols = columns_for_kind("Schema", "schemas", true, false, false, &HashMap::new());
+        assert_eq!(eval_column(&s_cols[1], &hydrating_schema, now).0, "…");
+        assert_eq!(eval_column(&s_cols[2], &hydrating_schema, now).0, "…");
     }
 }

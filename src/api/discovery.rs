@@ -22,7 +22,10 @@ impl ResourceDefinition {
     }
 
     pub fn is_declarative(&self) -> bool {
-        self.kind != "ConsumerGroup" && self.kind != "KafkaStream"
+        !matches!(
+            self.kind.as_str(),
+            "ConsumerGroup" | "ExternalConsumerGroup" | "ConsumerGroupMember" | "KafkaStream"
+        )
     }
 }
 
@@ -45,6 +48,9 @@ impl DiscoveryRegistry {
     pub fn from_server_list(mut list: Vec<ResourceDefinition>) -> Self {
         if !list.iter().any(|r| r.kind == "ConsumerGroup") {
             list.push(consumer_group_definition());
+        }
+        if !list.iter().any(|r| r.kind == "ExternalConsumerGroup") {
+            list.push(external_consumer_group_definition());
         }
         if !list.iter().any(|r| r.kind == "Namespace") {
             list.push(namespace_definition());
@@ -81,13 +87,14 @@ fn kind_order(kind: &str) -> usize {
         "Topic" => 0,
         "Connector" => 1,
         "ConsumerGroup" => 2,
-        "Schema" => 3,
-        "AccessControlEntry" => 4,
-        "KafkaStream" => 5,
-        "ConnectCluster" => 6,
-        "ResourceQuota" => 7,
-        "RoleBinding" => 8,
-        "Namespace" => 9,
+        "ExternalConsumerGroup" => 3,
+        "Schema" => 4,
+        "AccessControlEntry" => 5,
+        "KafkaStream" => 6,
+        "ConnectCluster" => 7,
+        "ResourceQuota" => 8,
+        "RoleBinding" => 9,
+        "Namespace" => 10,
         _ => 99,
     }
 }
@@ -107,6 +114,41 @@ pub fn consumer_group_definition() -> ResourceDefinition {
             "group".into(),
             "cg".into(),
         ],
+    }
+}
+
+pub fn external_consumer_group_definition() -> ResourceDefinition {
+    ResourceDefinition {
+        kind: "ExternalConsumerGroup".into(),
+        namespaced: true,
+        synchronizable: false,
+        path: "consumer-groups/_/external".into(),
+        names: vec![
+            "cg-ext".into(),
+            "cgext".into(),
+            "external-consumer-groups".into(),
+            "external-groups".into(),
+            "ext-cg".into(),
+        ],
+    }
+}
+
+/// Synthetic resource definition used when drilling down into a single ConsumerGroup's partitions (`Enter` on ConsumerGroup).
+pub fn consumer_group_member_definition(group: &str, ownership: &str) -> ResourceDefinition {
+    let path = if ownership.eq_ignore_ascii_case("External") {
+        format!(
+            "consumer-groups/_/external?name={}",
+            urlencoding::encode(group)
+        )
+    } else {
+        format!("consumer-groups?name={}", urlencoding::encode(group))
+    };
+    ResourceDefinition {
+        kind: "ConsumerGroupMember".into(),
+        namespaced: true,
+        synchronizable: false,
+        path,
+        names: vec!["cg-partitions".into()],
     }
 }
 
@@ -227,6 +269,8 @@ mod tests {
             ("acl", "AccessControlEntry"),
             ("cg", "ConsumerGroup"),
             ("consumer-groups", "ConsumerGroup"),
+            ("cg-ext", "ExternalConsumerGroup"),
+            ("ext-cg", "ExternalConsumerGroup"),
             ("st", "KafkaStream"),
             ("ks", "KafkaStream"),
             ("rb", "RoleBinding"),
