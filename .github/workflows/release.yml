@@ -127,8 +127,8 @@ jobs:
           $Tag = if ("${{ github.event.inputs.tag }}" -ne "") { "${{ github.event.inputs.tag }}" } else { "${{ github.ref_name }}" }
           $Pkg = "domite-$Tag-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$Pkg/completions" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/domite.exe" "dist/$Pkg/"
-          Copy-Item README.md LICENSE "dist/$Pkg/"
+          Copy-Item "target/${{ matrix.target }}/release/domite.exe" -Destination "dist/$Pkg/"
+          Copy-Item README.md, LICENSE -Destination "dist/$Pkg/"
           & "dist/$Pkg/domite.exe" --completions powershell > "dist/$Pkg/completions/_domite.ps1"
           Compress-Archive -Path "dist/$Pkg" -DestinationPath "dist/$Pkg.zip"
           $Hash = (Get-FileHash "dist/$Pkg.zip" -Algorithm SHA256).Hash.ToLower()
