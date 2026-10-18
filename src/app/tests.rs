@@ -413,8 +413,8 @@ async fn persistent_cache_seeds_table_on_restart_and_revalidates_in_background()
         assert_eq!(app1.rows[0].cells[2], "1042");
     }
 
-    // Allow background disk writer thread to flush JSON files
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    // Deterministically flush all pending disk writes from the background writer thread
+    cache.flush_blocking();
 
     // Session 2: cold restart with a fresh PersistentCache reading from the same directory;
     // BEFORE any network poll runs, App::new immediately renders the cached hydrated schemas!

@@ -64,6 +64,8 @@ enum DiskWriteJob {
         path: PathBuf,
         namespaces: Vec<(String, bool)>,
     },
+    #[cfg(test)]
+    Flush(std::sync::mpsc::SyncSender<()>),
 }
 
 type ViewCacheKey = (String, String, String);
@@ -366,6 +368,16 @@ impl PersistentCache {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
+    pub fn flush_blocking(&self) {
+        if let Some(tx) = &self.writer_tx {
+            let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+            if tx.send(DiskWriteJob::Flush(ack_tx)).is_ok() {
+                let _ = ack_rx.recv();
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // File Path Helpers
     // -----------------------------------------------------------------------
@@ -426,14 +438,39 @@ fn spawn_disk_writer() -> mpsc::UnboundedSender<DiskWriteJob> {
         .name("domite-cache-writer".into())
         .spawn(move || {
             while let Some(job) = rx.blocking_recv() {
-                // Coalesce any queued jobs for the same path
                 let mut latest_by_path: HashMap<PathBuf, DiskWriteJob> = HashMap::new();
-                latest_by_path.insert(job_path(&job).to_path_buf(), job);
-                while let Ok(next) = rx.try_recv() {
-                    latest_by_path.insert(job_path(&next).to_path_buf(), next);
+                #[cfg(test)]
+                let mut flush_acks = Vec::new();
+
+                match job {
+                    #[cfg(test)]
+                    DiskWriteJob::Flush(ack) => flush_acks.push(ack),
+                    other => {
+                        if let Some(p) = job_path(&other) {
+                            latest_by_path.insert(p.to_path_buf(), other);
+                        }
+                    }
                 }
+
+                while let Ok(next) = rx.try_recv() {
+                    match next {
+                        #[cfg(test)]
+                        DiskWriteJob::Flush(ack) => flush_acks.push(ack),
+                        other => {
+                            if let Some(p) = job_path(&other) {
+                                latest_by_path.insert(p.to_path_buf(), other);
+                            }
+                        }
+                    }
+                }
+
                 for (_, item) in latest_by_path {
                     write_job_to_disk(item);
+                }
+
+                #[cfg(test)]
+                for ack in flush_acks {
+                    let _ = ack.send(());
                 }
             }
         })
@@ -441,11 +478,13 @@ fn spawn_disk_writer() -> mpsc::UnboundedSender<DiskWriteJob> {
     tx
 }
 
-fn job_path(job: &DiskWriteJob) -> &Path {
+fn job_path(job: &DiskWriteJob) -> Option<&Path> {
     match job {
         DiskWriteJob::View { path, .. }
         | DiskWriteJob::Schemas { path, .. }
-        | DiskWriteJob::Namespaces { path, .. } => path,
+        | DiskWriteJob::Namespaces { path, .. } => Some(path),
+        #[cfg(test)]
+        DiskWriteJob::Flush(_) => None,
     }
 }
 
@@ -476,6 +515,8 @@ fn write_job_to_disk(job: DiskWriteJob) {
                 let _ = atomicfile::write(&path, &json);
             }
         }
+        #[cfg(test)]
+        DiskWriteJob::Flush(_) => {}
     }
 }
 
@@ -510,8 +551,8 @@ mod tests {
         });
         cache1.put_schema("dev", "team-orders/orders.v1-value".into(), schema, true);
 
-        // Wait briefly for background writer thread to flush
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        // Wait deterministically for the background writer thread to flush all files
+        cache1.flush_blocking();
 
         // Session 2: brand new PersistentCache instance reading from disk
         let cache2 = PersistentCache::new(Some(dir.clone()), 3600);
